@@ -1705,6 +1705,40 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
+    def test_custom_endpoint_v1_fallback_retries_without_v1(self, agent):
+        """Custom provider endpoints ending in /v1 should retry once without /v1 on 502 upstream failures."""
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.base_url = "https://example.com/v1"
+        agent._client_kwargs = {"base_url": agent.base_url, "api_key": "test-key"}
+
+        class FakeAPIError(Exception):
+            def __init__(self, status_code, body):
+                super().__init__(body)
+                self.status_code = status_code
+                self.body = body
+
+            def __str__(self):
+                return self.body
+
+        first_error = FakeAPIError(502, "Upstream request failed: /v1/responses returned 502")
+        success_resp = _mock_response(content="Success", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_apply_client_headers_for_base_url") as mock_apply_headers,
+            patch.object(agent, "_replace_primary_openai_client") as mock_replace_client,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent._interruptible_api_call = MagicMock(side_effect=[first_error, success_resp])
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Success"
+        assert result["completed"] is True
+        assert agent.base_url == "https://example.com"
+        assert mock_replace_client.called
+
     def test_inline_think_blocks_reasoning_only_accepted(self, agent):
         """Inline <think> reasoning-only responses accepted with (empty) content, no retries."""
         self._setup_agent(agent)

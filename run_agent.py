@@ -8983,6 +8983,48 @@ class AIAgent:
                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
+                    # ── Custom endpoint /v1 compatibility fallback ──────────
+                    # Some third-party API gateways expose a working Responses
+                    # endpoint at `/responses` but return 5xx for `/v1/responses`
+                    # (while still serving `/v1/models`). If we see a 502 on a
+                    # custom endpoint whose base_url ends in `/v1`, try trimming
+                    # it once and retry the request.
+                    if (
+                        status_code == 502
+                        and (getattr(self, "provider", "") or "") == "custom"
+                        and isinstance(getattr(self, "base_url", None), str)
+                        and self.base_url.rstrip("/").endswith("/v1")
+                        and not getattr(self, "_custom_trimmed_v1_retry_attempted", False)
+                    ):
+                        _body = getattr(api_error, "body", None)
+                        _body_text = str(_body).lower() if _body is not None else ""
+                        _msg_text = str(api_error).lower()
+                        _looks_like_upstream = (
+                            "upstream request failed" in _msg_text
+                            or "upstream" in _body_text
+                        )
+                        if _looks_like_upstream:
+                            self._custom_trimmed_v1_retry_attempted = True
+                            _old = self.base_url.rstrip("/")
+                            _new = _old[:-3] if _old.endswith("/v1") else _old
+                            if _new and _new != _old:
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Custom endpoint returned HTTP 502 at {_old}. "
+                                    f"Retrying with base_url={_new} (trimmed '/v1').",
+                                    force=True,
+                                )
+                                try:
+                                    self.base_url = _new
+                                    if isinstance(getattr(self, "_client_kwargs", None), dict):
+                                        self._client_kwargs["base_url"] = self.base_url
+                                        self._client_kwargs["api_key"] = getattr(self, "api_key", "")
+                                    self._apply_client_headers_for_base_url(self.base_url)
+                                    self._replace_primary_openai_client(reason="custom_trim_v1_fallback")
+                                    continue
+                                except Exception:
+                                    # If anything goes wrong, fall through to normal handling.
+                                    pass
+
                     # ── Thinking block signature recovery ─────────────────
                     # Anthropic signs thinking blocks against the full turn
                     # content.  Any upstream mutation (context compression,
